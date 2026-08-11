@@ -1,0 +1,440 @@
+% =========================================================================
+% Deep Learning Model Comparison
+% Models : DarkNet-19, ResNet-18, InceptionV3, AlexNet, SqueezeNet, Custom CNN
+% Classes: 5
+%
+% This script fine-tunes six CNN architectures via transfer learning,
+% evaluates them over multiple random seeds using an 80/10/10
+% train/validation/test split, and performs 3-fold cross-validation on
+% the best-performing model. For every model/seed/fold, Accuracy is
+% computed from the confusion matrix for both the Validation and Test
+% splits.
+% =========================================================================
+
+clear; clc; close all;
+
+%% 0. Output Settings
+% Trained network objects can optionally be saved to disk (this can
+% produce large files: 6 models x 3 seeds, tens to hundreds of MB each).
+resultsFolder = "Results";
+saveNetworksToDisk = false;
+
+if saveNetworksToDisk
+    ensureFolder(resultsFolder);
+    ensureFolder(fullfile(resultsFolder, 'Networks'));
+end
+
+%% 0.1 Hardware (GPU) Check
+if canUseGPU()
+    execEnv = 'gpu';
+    g = gpuDevice();
+    fprintf('GPU detected and will be used: %s\n', g.Name);
+else
+    execEnv = 'cpu';
+    fprintf('No compatible GPU found, training will run on CPU.\n');
+end
+
+%% 1. Dataset Loading
+imds = imageDatastore('Data', 'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+classNames = categories(imds.Labels);
+numClasses = numel(classNames);
+
+if numClasses ~= 5
+    warning('Expected 5 classes were not found in the dataset. Please check the folder structure.');
+end
+
+%% 2. Experiment Parameters
+seeds = [20, 30, 40];
+modelNames = {'DarkNet-19', 'ResNet-18', 'InceptionV3', 'AlexNet', 'SqueezeNet', 'Normal-CNN'};
+numModels = length(modelNames);
+numSeeds = length(seeds);
+
+testAccuracies = zeros(numModels, numSeeds);   % unbiased final reporting only (not used for model selection)
+valAccuracies  = zeros(numModels, numSeeds);   % used for model ranking / best-model selection
+MetricsAll = table();                          % Model, Seed, Split, Accuracy
+
+%% 3. SECTION 1: Training with an 80/10/10 Split Across Multiple Seeds
+fprintf('--- SECTION 1: Training with 80/10/10 split across multiple seeds ---\n');
+
+for s = 1:numSeeds
+    fprintf('\n>>> Running seed %d...\n', seeds(s));
+    rng(seeds(s));
+
+    [imdsTrain, imdsVal, imdsTest] = splitEachLabel(imds, 0.8, 0.1, 0.1, 'randomized');
+    YVal  = toColumn(imdsVal.Labels);
+    YTest = toColumn(imdsTest.Labels);
+
+    for m = 1:numModels
+        fprintf('Training model [%d/%d]: %s\n', m, numModels, modelNames{m});
+
+        [lgraph, inputSize] = prepareModel(modelNames{m}, numClasses);
+        lgraph = freezeHalfLayers(lgraph);
+        netToTrain = dlnetwork(lgraph);
+
+        augTrain = augmentedImageDatastore(inputSize(1:2), imdsTrain);
+        augVal   = augmentedImageDatastore(inputSize(1:2), imdsVal);
+        augTest  = augmentedImageDatastore(inputSize(1:2), imdsTest);
+
+        options = trainingOptions('sgdm', ...
+            'MiniBatchSize', 8, ...
+            'MaxEpochs', 25, ...
+            'InitialLearnRate', 1e-4, ...
+            'Metrics', 'accuracy', ...
+            'Shuffle', 'every-epoch', ...
+            'ValidationData', augVal, ...
+            'ValidationFrequency', 100, ...
+            'Verbose', false, ...
+            'ValidationPatience', 5, ...
+            'ExecutionEnvironment', execEnv, ...
+            'Plots', 'training-progress');
+
+        netTransfer = trainnet(augTrain, netToTrain, "crossentropy", options);
+
+        if saveNetworksToDisk
+            try
+                netPath = fullfile(resultsFolder, 'Networks', ...
+                    sprintf('%s_seed%d.mat', safeName(modelNames{m}), seeds(s)));
+                save(netPath, 'netTransfer', '-v7.3');
+            catch ME
+                warning('Could not save network (%s, seed %d): %s', modelNames{m}, seeds(s), ME.message);
+            end
+        end
+
+        % ---------------- Validation evaluation ----------------------
+        scoresVal = minibatchpredict(netTransfer, augVal);
+        YPredVal = scores2label(scoresVal, classNames);
+        YPredVal = toColumn(YPredVal);
+
+        accVal = computeAccuracy(YVal, YPredVal, classNames);
+        valAccuracies(m, s) = accVal;
+
+        rowVal = table();
+        rowVal.Model = string(modelNames{m});
+        rowVal.Seed = seeds(s);
+        rowVal.Split = "Validation";
+        rowVal.Accuracy = accVal;
+        MetricsAll = [MetricsAll; rowVal]; %#ok<AGROW>
+
+        % ---------------- Test evaluation -----------------------------
+        scoresTest = minibatchpredict(netTransfer, augTest);
+        YPredTest = scores2label(scoresTest, classNames);
+        YPredTest = toColumn(YPredTest);
+
+        accTest = computeAccuracy(YTest, YPredTest, classNames);
+        testAccuracies(m, s) = accTest;
+
+        rowTest = table();
+        rowTest.Model = string(modelNames{m});
+        rowTest.Seed = seeds(s);
+        rowTest.Split = "Test";
+        rowTest.Accuracy = accTest;
+        MetricsAll = [MetricsAll; rowTest]; %#ok<AGROW>
+
+        fprintf('%s | Val Acc=%.4f | Test Acc=%.4f\n', modelNames{m}, accVal, accTest);
+    end
+end
+
+%% 4. Mean and Standard Deviation of Results (Validation & Test)
+fprintf('\n--- 80/10/10 SPLIT RESULTS (Mean +/- Std) ---\n');
+% NOTE ON MODEL SELECTION: the Test split is reserved for a final, unbiased
+% performance estimate and must not influence any decision. The best
+% architecture (used below for the Section 5 CV stage) is therefore
+% selected using Validation accuracy, not Test accuracy.
+meanAcc = mean(testAccuracies, 2);      % Test-based - reporting only, NOT used for selection
+stdAcc = std(testAccuracies, 0, 2);
+meanValAcc = mean(valAccuracies, 2);    % Validation-based - used for model selection
+stdValAcc = std(valAccuracies, 0, 2);
+
+SummaryTable = buildSummaryTable(MetricsAll, modelNames);
+disp('================= SUMMARY TABLE (80/10/10, Val & Test, Mean +/- Std) =================');
+disp(SummaryTable);
+
+for m = 1:numModels
+    fprintf('%-15s: Val %.2f%% +/- %.2f%% | Test %.2f%% +/- %.2f%%\n', modelNames{m}, ...
+        meanValAcc(m) * 100, stdValAcc(m) * 100, meanAcc(m) * 100, stdAcc(m) * 100);
+end
+
+%% 5. SECTION 2: 3-Fold Cross-Validation on the Best Single Model (Val + Test)
+% The single best model identified above (by mean Validation accuracy)
+% is retrained from scratch for each of the 3 folds; no other model is
+% trained in this section. The 3-fold split is applied directly to the
+% full dataset (imds), so each fold's test partition is itself a held-out
+% test set - no additional test set is created. A small portion of each
+% fold's training partition is further set aside only for early stopping,
+% not as an additional test evaluation.
+fprintf('\n--- SECTION 2: 3-Fold Cross-Validation on the Best Model ---\n');
+[~, bestIdxCV] = max(meanValAcc);
+bestModelForCV = modelNames{bestIdxCV};
+
+fprintf('Selected best model (for 3-fold CV): %s\n', bestModelForCV);
+
+CVMetricsAll = table();   % Model, Fold, Split, Accuracy
+
+rng(42);
+cv = cvpartition(imds.Labels, 'KFold', 3);   % applied directly to the full dataset
+
+for fold = 1:3
+    fprintf('\n>>> Running fold %d/3 (Model: %s)...\n', fold, bestModelForCV);
+
+    idxTrain = training(cv, fold);
+    idxTest  = test(cv, fold);              % held-out test partition for this fold
+
+    imdsCVTrainFull = subset(imds, find(idxTrain));
+    imdsCVTest = subset(imds, find(idxTest));
+    YTestCV = toColumn(imdsCVTest.Labels);
+
+    % Small hold-out from the training partition, used only for early stopping
+    cvSub = cvpartition(imdsCVTrainFull.Labels, 'HoldOut', 0.1);
+    imdsCVTrain = subset(imdsCVTrainFull, training(cvSub));
+    imdsCVVal   = subset(imdsCVTrainFull, test(cvSub));
+    YValCV = toColumn(imdsCVVal.Labels);
+
+    % Model is rebuilt and trained from scratch for each fold
+    [lgraph, inputSize] = prepareModel(bestModelForCV, numClasses);
+    lgraph = freezeHalfLayers(lgraph);
+    netToTrain = dlnetwork(lgraph);
+
+    augCVTrain = augmentedImageDatastore(inputSize(1:2), imdsCVTrain);
+    augCVVal   = augmentedImageDatastore(inputSize(1:2), imdsCVVal);
+    augCVTest  = augmentedImageDatastore(inputSize(1:2), imdsCVTest);
+
+    options = trainingOptions('sgdm', 'MiniBatchSize', 8, 'MaxEpochs', 25, ...
+        'InitialLearnRate', 1e-4, 'Metrics', 'accuracy', ...
+        'Shuffle', 'every-epoch', 'Verbose', false, ...
+        'ValidationData', augCVVal, ...
+        'ValidationFrequency', 50, ...
+        'ValidationPatience', 5, ...
+        'ExecutionEnvironment', execEnv, ...
+        'Plots', 'training-progress');
+
+    netTransfer = trainnet(augCVTrain, netToTrain, "crossentropy", options);
+
+    if saveNetworksToDisk
+        try
+            netPath = fullfile(resultsFolder, 'Networks', ...
+                sprintf('CV_%s_fold%d.mat', safeName(bestModelForCV), fold));
+            save(netPath, 'netTransfer', '-v7.3');
+        catch ME
+            warning('Could not save CV network (%s, fold %d): %s', bestModelForCV, fold, ME.message);
+        end
+    end
+
+    % ---------------- Validation evaluation (early-stopping split) -----
+    scoresValCV = minibatchpredict(netTransfer, augCVVal);
+    YPredValCV = scores2label(scoresValCV, classNames);
+    YPredValCV = toColumn(YPredValCV);
+
+    accValCV = computeAccuracy(YValCV, YPredValCV, classNames);
+
+    rowValCV = table();
+    rowValCV.Model = string(bestModelForCV);
+    rowValCV.Fold = fold;
+    rowValCV.Split = "Validation";
+    rowValCV.Accuracy = accValCV;
+    CVMetricsAll = [CVMetricsAll; rowValCV]; %#ok<AGROW>
+
+    % ---------------- Test evaluation (fold's held-out test partition) --
+    scoresTestCV = minibatchpredict(netTransfer, augCVTest);
+    YPredTestCV = scores2label(scoresTestCV, classNames);
+    YPredTestCV = toColumn(YPredTestCV);
+
+    accTestCV = computeAccuracy(YTestCV, YPredTestCV, classNames);
+
+    rowTestCV = table();
+    rowTestCV.Model = string(bestModelForCV);
+    rowTestCV.Fold = fold;
+    rowTestCV.Split = "Test";
+    rowTestCV.Accuracy = accTestCV;
+    CVMetricsAll = [CVMetricsAll; rowTestCV]; %#ok<AGROW>
+
+    fprintf('%s Fold %d | Val Acc=%.4f | Test Acc=%.4f\n', bestModelForCV, fold, accValCV, accTestCV);
+end
+
+%% 6. Cross-Validation Results Summary
+disp('================= 3-FOLD CV RESULTS (Validation & Test, per fold) =================');
+disp(CVMetricsAll);
+
+fprintf('\nAll computations completed.\n');
+
+
+%% ========================================================================
+% HELPER FUNCTIONS
+% ========================================================================
+
+function [lgraph, inputSize] = prepareModel(modelName, numClasses)
+    switch modelName
+        case 'DarkNet-19'
+            net = darknet19;
+            lgraph = layerGraph(net);
+            inputSize = net.Layers(1).InputSize;
+
+            newConv = convolution2dLayer(1, numClasses, 'Name', 'new_conv19', ...
+                'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10);
+            lgraph = replaceLayer(lgraph, 'conv19', newConv);
+            lgraph = removeOutputLayers(lgraph);
+
+        case 'ResNet-18'
+            net = resnet18;
+            lgraph = layerGraph(net);
+            inputSize = net.Layers(1).InputSize;
+
+            newFc = fullyConnectedLayer(numClasses, 'Name', 'new_fc1000', ...
+                'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10);
+            lgraph = replaceLayer(lgraph, 'fc1000', newFc);
+            lgraph = removeOutputLayers(lgraph);
+
+        case 'InceptionV3'
+            net = inceptionv3;
+            lgraph = layerGraph(net);
+            inputSize = net.Layers(1).InputSize;
+
+            newFc = fullyConnectedLayer(numClasses, 'Name', 'new_predictions', ...
+                'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10);
+            lgraph = replaceLayer(lgraph, 'predictions', newFc);
+            lgraph = removeOutputLayers(lgraph);
+
+        case 'AlexNet'
+            net = alexnet;
+            lgraph = layerGraph(net);
+            inputSize = net.Layers(1).InputSize;
+
+            newFc = fullyConnectedLayer(numClasses, 'Name', 'new_fc8', ...
+                'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10);
+            lgraph = replaceLayer(lgraph, 'fc8', newFc);
+            lgraph = removeOutputLayers(lgraph);
+
+        case 'SqueezeNet'
+            net = squeezenet;
+            lgraph = layerGraph(net);
+            inputSize = net.Layers(1).InputSize;
+
+            newConv = convolution2dLayer(1, numClasses, 'Name', 'new_conv10', ...
+                'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10);
+            lgraph = replaceLayer(lgraph, 'conv10', newConv);
+            lgraph = removeOutputLayers(lgraph);
+
+        case 'Normal-CNN'
+            inputSize = [224 224 3];
+            layers = [
+                imageInputLayer(inputSize, 'Name', 'input')
+                convolution2dLayer(3, 16, 'Padding', 'same', 'Name', 'conv_1')
+                batchNormalizationLayer('Name', 'bn_1')
+                reluLayer('Name', 'relu_1')
+                maxPooling2dLayer(2, 'Stride', 2, 'Name', 'pool_1')
+
+                convolution2dLayer(3, 32, 'Padding', 'same', 'Name', 'conv_2')
+                batchNormalizationLayer('Name', 'bn_2')
+                reluLayer('Name', 'relu_2')
+                maxPooling2dLayer(2, 'Stride', 2, 'Name', 'pool_2')
+
+                convolution2dLayer(3, 64, 'Padding', 'same', 'Name', 'conv_3')
+                batchNormalizationLayer('Name', 'bn_3')
+                reluLayer('Name', 'relu_3')
+                fullyConnectedLayer(numClasses, 'Name', 'fc_final')
+                softmaxLayer('Name', 'softmax')
+            ];
+            lgraph = layerGraph(layers);
+    end
+end
+
+function lgraph = removeOutputLayers(lgraph)
+    layers = lgraph.Layers;
+    for i = 1:numel(layers)
+        if isa(layers(i), 'nnet.cnn.layer.ClassificationOutputLayer') || ...
+           isa(layers(i), 'nnet.cnn.layer.RegressionOutputLayer')
+            lgraph = removeLayers(lgraph, layers(i).Name);
+        end
+    end
+end
+
+function lgraph = freezeHalfLayers(lgraph)
+    layers = lgraph.Layers;
+    learnableLayerIdx = [];
+
+    for i = 1:numel(layers)
+        if isprop(layers(i), 'WeightLearnRateFactor') || isprop(layers(i), 'BiasLearnRateFactor')
+            learnableLayerIdx = [learnableLayerIdx; i];
+        end
+    end
+
+    numToFreeze = floor(length(learnableLayerIdx) / 2);
+
+    for i = 1:numToFreeze
+        idx = learnableLayerIdx(i);
+        layer = layers(idx);
+
+        if isprop(layer, 'WeightLearnRateFactor')
+            layer.WeightLearnRateFactor = 0;
+        end
+        if isprop(layer, 'BiasLearnRateFactor')
+            layer.BiasLearnRateFactor = 0;
+        end
+
+        lgraph = replaceLayer(lgraph, layer.Name, layer);
+    end
+end
+
+function v = toColumn(x)
+% Reshapes any array (e.g. 1x1x1xN, 1xN, Nx1) into an Nx1 column vector.
+% scores2label can return predictions in a non-Nx1 shape for some
+% architectures whose spatial output does not fully collapse; without
+% this normalization, comparisons against the Nx1 ground-truth labels
+% would fail or silently misbehave.
+    v = reshape(x, [], 1);
+end
+
+function nm = safeName(s)
+    nm = regexprep(char(s), '[^a-zA-Z0-9_\-]', '_');
+end
+
+function ensureFolder(p)
+    if ~exist(p, 'dir')
+        mkdir(p);
+    end
+end
+
+function acc = computeAccuracy(YTrue, YPred, classNames)
+% Computes Accuracy from the confusion matrix. YTrue/YPred are first
+% normalized to Nx1 column vectors via toColumn() to avoid shape
+% mismatches.
+    YTrue = toColumn(categorical(YTrue, classNames));
+    YPred = toColumn(categorical(YPred, classNames));
+
+    confMat = confusionmat(YTrue, YPred, 'Order', classNames);
+    acc = sum(diag(confMat)) / sum(confMat(:));
+end
+
+function T = buildSummaryTable(MetricsAll, modelNamesList)
+% Aggregates (Model, Split, Accuracy) rows from MetricsAll into a single
+% summary table with mean and std accuracy per model, for both the
+% Validation and Test splits.
+    nM = numel(modelNamesList);
+    T = table();
+    T.Model = string(modelNamesList)';
+
+    splits = {'Validation', 'Test'};
+
+    for sp = 1:numel(splits)
+        splitName = splits{sp};
+        if strcmp(splitName, 'Validation')
+            prefix = 'Val';
+        else
+            prefix = 'Test';
+        end
+
+        meanCol = zeros(nM, 1);
+        stdCol  = zeros(nM, 1);
+        for i = 1:nM
+            idxRows = (MetricsAll.Model == string(modelNamesList{i})) & (MetricsAll.Split == splitName);
+            vals = MetricsAll.Accuracy(idxRows);
+            if isempty(vals)
+                meanCol(i) = NaN; stdCol(i) = NaN;
+            else
+                meanCol(i) = mean(vals);
+                stdCol(i)  = std(vals);
+            end
+        end
+        T.(sprintf('%s_MeanAccuracy', prefix)) = meanCol;
+        T.(sprintf('%s_StdAccuracy', prefix))  = stdCol;
+    end
+end
