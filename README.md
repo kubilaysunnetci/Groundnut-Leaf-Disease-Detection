@@ -22,21 +22,5 @@ The evaluation framework consists of a multi-seed benchmark using an 80/10/10 sp
 
 ---
 
-## 📁 Repository Structure
-
-```text
-.
-├── Data/                          # Root folder for image dataset
-│   ├── Class_1/
-│   ├── Class_2/
-│   ├── Class_3/
-│   ├── Class_4/
-│   └── Class_5/
-├── Results/                       # Output directory (created automatically)
-│   └── Networks/                  # Saved .mat trained models (if enabled)
-├── main_evaluation.m             # Main MATLAB benchmark & evaluation script
-├── README.md                      # Documentation
-└── LICENSE                        # License file
-
 Data availability
 	The data that support the findings of this study are openly available in Mendeley Data at https://data.mendeley.com/datasets/x6x5jkk873/2. The dataset is described in detail and cited as: Sasmal, B., et al. (2024), "A novel groundnut leaf dataset for detection and classification of groundnut leaf diseases", Data in Brief, 55, 110763.
